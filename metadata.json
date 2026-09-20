@@ -1,0 +1,8 @@
+{
+  "name": "Dr. Kaiser's Clinic",
+  "description": "Official portal for Dr. Kaiser's Clinic featuring appointment booking, live token queue status, patient fee entitlement lookup, and reception dashboard.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
