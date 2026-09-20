@@ -67,11 +67,14 @@ export const DeveloperDesk: React.FC<DeveloperDeskProps> = ({ onBackToHome }) =>
   const [formData, setFormData] = useState<ClinicSiteConfig>(() => ({
     ...siteConfig
   }));
+  const [isFormDirty, setIsFormDirty] = useState<boolean>(false);
 
-  // Sync internal state when siteConfig updates externally
+  // Sync internal state when siteConfig updates externally (unless user has active unsaved form edits)
   React.useEffect(() => {
-    setFormData({ ...siteConfig });
-  }, [siteConfig]);
+    if (!isFormDirty) {
+      setFormData({ ...siteConfig });
+    }
+  }, [siteConfig, isFormDirty]);
 
   // Notifications
   const [saveSuccessMessage, setSaveSuccessMessage] = useState<string | null>(null);
@@ -102,11 +105,18 @@ export const DeveloperDesk: React.FC<DeveloperDeskProps> = ({ onBackToHome }) =>
     setSaveErrorMessage(null);
     try {
       updateSiteConfig(formData);
+      setIsFormDirty(false);
       setSaveSuccessMessage('All website settings and branding successfully saved and synced across all devices!');
       setTimeout(() => setSaveSuccessMessage(null), 6000);
     } catch (err: any) {
       setSaveErrorMessage('Failed to save configuration: ' + err.message);
     }
+  };
+
+  const handleForceSync = async () => {
+    await forceSyncNow();
+    setIsFormDirty(false);
+    setFormData({ ...siteConfig });
   };
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -318,7 +328,7 @@ export const DeveloperDesk: React.FC<DeveloperDeskProps> = ({ onBackToHome }) =>
           </div>
 
           <button
-            onClick={() => forceSyncNow()}
+            onClick={handleForceSync}
             className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 transition-colors"
             title="Force refresh database from central server"
           >

@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import {
   ClinicDatabaseState,
   ClinicAppointment,
@@ -17,6 +17,20 @@ import { generatePostgreSqlDump } from '../utils/sqlExporter';
 const STORAGE_KEY = 'dkc_clinic_database_v2';
 const DEV_SESSION_KEY = 'dkc_developer_session';
 export const CURRENT_DATE_STRING = '2026-09-13';
+
+// Unique session device ID to differentiate local updates from incoming remote broadcasts
+const getDeviceId = (): string => {
+  try {
+    let id = sessionStorage.getItem('clinic_device_session_id');
+    if (!id) {
+      id = 'dev_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now();
+      sessionStorage.setItem('clinic_device_session_id', id);
+    }
+    return id;
+  } catch {
+    return 'dev_' + Math.random().toString(36).substring(2, 9);
+  }
+};
 
 interface BookAppointmentInput {
   patient_name: string;
@@ -136,6 +150,12 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
 
+  // Sync flow flags:
+  // isIncomingUpdate prevents incoming server broadcasts from triggering an outgoing push back to server
+  const isIncomingUpdate = useRef<boolean>(false);
+  // isInitialLoadDone prevents a newly opened device from overwriting the server with its empty/stale local state
+  const isInitialLoadDone = useRef<boolean>(false);
+
   // Undo stack
   const [undoStack, setUndoStack] = useState<UndoHistoryEntry[]>([]);
   const [lastActionMessage, setLastActionMessage] = useState<string | null>(null);
@@ -162,12 +182,14 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setLastActionMessage(description);
   };
 
-  // 1. Initial load from server disk (so any device gets latest server state on connect)
+  // 1. Initial load from server disk + establish SSE connection for real-time live synchronization
   useEffect(() => {
     let mounted = true;
+    let eventSource: EventSource | null = null;
+
     const fetchServerDb = async () => {
       try {
-        const res = await fetch('/api/clinic-db');
+        const res = await fetch('/api/clinic-db?t=' + Date.now());
         if (res.ok) {
           const json = await res.json();
           if (json.success && json.data && mounted) {
@@ -178,27 +200,41 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             if (!serverData.site_config) {
               serverData.site_config = INITIAL_SITE_CONFIG;
             }
+            isIncomingUpdate.current = true;
             setDb(serverData);
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(serverData));
+            } catch {}
             setLastSyncedAt(new Date().toLocaleTimeString());
           }
         }
       } catch (err) {
         console.info('Operating in standalone mode', err);
+      } finally {
+        if (mounted) {
+          isInitialLoadDone.current = true;
+        }
       }
     };
-    fetchServerDb();
-    return () => { mounted = false; };
-  }, []);
 
-  // 2. Continuous multi-device sync poll (every 3.5 seconds)
-  useEffect(() => {
-    const interval = setInterval(async () => {
-      try {
-        const res = await fetch('/api/clinic-db?t=' + Date.now());
-        if (res.ok) {
-          const json = await res.json();
-          if (json.success && json.data) {
-            const serverData: ClinicDatabaseState = json.data;
+    fetchServerDb();
+
+    // Setup Server-Sent Events (SSE) stream for instant real-time broadcast across devices
+    try {
+      eventSource = new EventSource('/api/clinic-db/events');
+
+      eventSource.onmessage = (event) => {
+        if (!mounted) return;
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload && payload.data) {
+            // Ignore echoes of changes this device initiated
+            const myDeviceId = getDeviceId();
+            if (payload.sourceDeviceId && payload.sourceDeviceId === myDeviceId) {
+              return;
+            }
+
+            const serverData: ClinicDatabaseState = payload.data;
             if (!serverData.gallery || !Array.isArray(serverData.gallery) || serverData.gallery.length === 0) {
               serverData.gallery = INITIAL_GALLERY;
             }
@@ -207,30 +243,96 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             }
 
             setDb((current) => {
-              const serverTs = serverData.last_modified_timestamp || 0;
+              const serverTs = serverData.last_modified_timestamp || payload.timestamp || 0;
               const currentTs = current.last_modified_timestamp || 0;
-              // If server has newer data, update local state
-              if (serverTs > currentTs) {
+              if (serverTs >= currentTs || payload.type === 'INITIAL_SYNC') {
+                isIncomingUpdate.current = true;
+                try {
+                  localStorage.setItem(STORAGE_KEY, JSON.stringify(serverData));
+                } catch {}
+                setLastSyncedAt(new Date().toLocaleTimeString());
                 return serverData;
               }
               return current;
             });
-            setLastSyncedAt(new Date().toLocaleTimeString());
+          }
+        } catch (err) {
+          console.error('Failed to parse incoming SSE message:', err);
+        }
+      };
+
+      eventSource.onerror = () => {
+        // SSE automatically reconnects
+      };
+    } catch (e) {
+      console.warn('SSE not supported or blocked:', e);
+    }
+
+    return () => {
+      mounted = false;
+      if (eventSource) {
+        eventSource.close();
+      }
+    };
+  }, []);
+
+  // 2. High-reliability continuous multi-device sync poll (every 2.5 seconds)
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch('/api/clinic-db?t=' + Date.now());
+        if (res.ok) {
+          const json = await res.json();
+          if (json.success && json.data) {
+            const serverData: ClinicDatabaseState = json.data;
+            const serverTs = serverData.last_modified_timestamp || json.timestamp || 0;
+
+            setDb((current) => {
+              const currentTs = current.last_modified_timestamp || 0;
+              if (serverTs > currentTs) {
+                if (!serverData.gallery || !Array.isArray(serverData.gallery) || serverData.gallery.length === 0) {
+                  serverData.gallery = INITIAL_GALLERY;
+                }
+                if (!serverData.site_config) {
+                  serverData.site_config = INITIAL_SITE_CONFIG;
+                }
+                isIncomingUpdate.current = true;
+                try {
+                  localStorage.setItem(STORAGE_KEY, JSON.stringify(serverData));
+                } catch {}
+                setLastSyncedAt(new Date().toLocaleTimeString());
+                return serverData;
+              }
+              return current;
+            });
           }
         }
       } catch {
         // quiet ignore for intermittent connectivity
       }
-    }, 3500);
+    }, 2500);
     return () => clearInterval(interval);
   }, []);
 
-  // 3. Save changes to localStorage AND push to server (visible to public and all devices)
+  // 3. Save local modifications to localStorage AND push to server (visible to public and all devices)
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
     } catch (e) {
       console.error('Failed to save clinic state locally', e);
+    }
+
+    // CRITICAL: Do NOT push to server if initial load hasn't completed
+    // (Prevents a device on mount from overwriting server with stale default!)
+    if (!isInitialLoadDone.current) {
+      return;
+    }
+
+    // CRITICAL: Do NOT push back to server if this state update came from the server
+    // (Prevents infinite ping-pong loops between devices!)
+    if (isIncomingUpdate.current) {
+      isIncomingUpdate.current = false;
+      return;
     }
 
     const pushToServer = async () => {
@@ -239,7 +341,10 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         const res = await fetch('/api/clinic-db', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ db })
+          body: JSON.stringify({
+            db,
+            sourceDeviceId: getDeviceId()
+          })
         });
         if (res.ok) {
           setLastSyncedAt(new Date().toLocaleTimeString());
@@ -251,7 +356,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
     };
 
-    const timer = setTimeout(pushToServer, 350);
+    const timer = setTimeout(pushToServer, 150);
     return () => clearTimeout(timer);
   }, [db]);
 
@@ -897,7 +1002,11 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
           const s = json.data;
           if (!s.gallery) s.gallery = INITIAL_GALLERY;
           if (!s.site_config) s.site_config = INITIAL_SITE_CONFIG;
+          isIncomingUpdate.current = true;
           setDb(s);
+          try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+          } catch {}
           setLastSyncedAt(new Date().toLocaleTimeString());
         }
       }
@@ -906,7 +1015,7 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   };
 
-  // Gallery CRUD Operations
+  // Gallery CRUD Operations with immediate server broadcast
   const addGalleryItem = (item: Omit<ClinicGalleryItem, 'id' | 'created_at'>): ClinicGalleryItem => {
     pushUndoSnapshot(`Added photo "${item.title}" to gallery`);
     const newItem: ClinicGalleryItem = {
@@ -914,16 +1023,37 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       id: 'pic-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
       created_at: new Date().toISOString()
     };
+    const now = Date.now();
     setDb((prev) => ({
       ...prev,
-      last_modified_timestamp: Date.now(),
+      last_modified_timestamp: now,
       gallery: [newItem, ...(prev.gallery || [])]
     }));
+
+    // Immediate dedicated push for instant multi-device sync
+    fetch('/api/gallery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'add',
+        item: newItem,
+        sourceDeviceId: getDeviceId()
+      })
+    })
+      .then((res) => res.json())
+      .then((json) => {
+        if (json.success) {
+          setLastSyncedAt(new Date().toLocaleTimeString());
+        }
+      })
+      .catch((e) => console.warn('Gallery push error:', e));
+
     return newItem;
   };
 
   const updateGalleryItem = (id: string, updates: Partial<ClinicGalleryItem>) => {
     pushUndoSnapshot(`Updated photo in gallery`);
+    const now = Date.now();
     setDb((prev) => {
       const copy = [...(prev.gallery || [])];
       const idx = copy.findIndex((g) => g.id === id);
@@ -932,44 +1062,111 @@ export const ClinicProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
       return {
         ...prev,
-        last_modified_timestamp: Date.now(),
+        last_modified_timestamp: now,
         gallery: copy
       };
     });
+
+    fetch('/api/gallery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'update',
+        id,
+        item: updates,
+        sourceDeviceId: getDeviceId()
+      })
+    })
+      .then((res) => res.json())
+      .then((json) => {
+        if (json.success) {
+          setLastSyncedAt(new Date().toLocaleTimeString());
+        }
+      })
+      .catch((e) => console.warn('Gallery update push error:', e));
   };
 
   const deleteGalleryItem = (id: string): boolean => {
     const item = (db.gallery || []).find((g) => g.id === id);
     pushUndoSnapshot(`Deleted photo "${item?.title || id}" from gallery`);
+    const now = Date.now();
     setDb((prev) => ({
       ...prev,
-      last_modified_timestamp: Date.now(),
+      last_modified_timestamp: now,
       gallery: (prev.gallery || []).filter((g) => g.id !== id)
     }));
+
+    fetch('/api/gallery', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'delete',
+        id,
+        sourceDeviceId: getDeviceId()
+      })
+    })
+      .then((res) => res.json())
+      .then((json) => {
+        if (json.success) {
+          setLastSyncedAt(new Date().toLocaleTimeString());
+        }
+      })
+      .catch((e) => console.warn('Gallery delete push error:', e));
+
     return true;
   };
 
-  // Site Configuration (Developer Desk)
+  // Site Configuration (Developer Desk) with immediate server broadcast
   const updateSiteConfig = (updates: Partial<ClinicSiteConfig>) => {
     pushUndoSnapshot(`Updated clinic website branding & settings`);
+    const now = Date.now();
+    const updatedConfig = {
+      ...(db.site_config || INITIAL_SITE_CONFIG),
+      ...updates,
+      updated_at: new Date().toISOString()
+    };
+
     setDb((prev) => ({
       ...prev,
-      last_modified_timestamp: Date.now(),
-      site_config: {
-        ...(prev.site_config || INITIAL_SITE_CONFIG),
-        ...updates,
-        updated_at: new Date().toISOString()
-      }
+      last_modified_timestamp: now,
+      site_config: updatedConfig
     }));
+
+    // Immediate dedicated push for instant multi-device sync
+    fetch('/api/update-site-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        site_config: updatedConfig,
+        sourceDeviceId: getDeviceId()
+      })
+    })
+      .then((res) => res.json())
+      .then((json) => {
+        if (json.success) {
+          setLastSyncedAt(new Date().toLocaleTimeString());
+        }
+      })
+      .catch((e) => console.warn('Failed to immediately push site config:', e));
   };
 
   const resetSiteConfigToDefault = () => {
     pushUndoSnapshot(`Reset site configuration to initial default`);
+    const now = Date.now();
     setDb((prev) => ({
       ...prev,
-      last_modified_timestamp: Date.now(),
+      last_modified_timestamp: now,
       site_config: INITIAL_SITE_CONFIG
     }));
+
+    fetch('/api/update-site-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        site_config: INITIAL_SITE_CONFIG,
+        sourceDeviceId: getDeviceId()
+      })
+    }).catch(() => {});
   };
 
   const resetToInitialDb = () => {
